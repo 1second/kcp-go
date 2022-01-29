@@ -40,6 +40,11 @@ func currentMs() uint32 { return uint32(time.Since(refTime) / time.Millisecond) 
 // output_callback is a prototype which ought capture conn and call conn.Write
 type output_callback func(buf []byte, size int)
 
+type InputCallback interface {
+	Input(buf []byte, size int)
+	WndUnused() uint16
+}
+
 /* encode 8 bits unsigned int */
 func ikcp_encode8u(p []byte, c byte) []byte {
 	p[0] = c
@@ -155,6 +160,7 @@ type KCP struct {
 	buffer   []byte
 	reserved int
 	output   output_callback
+	input    InputCallback
 }
 
 type ackItem struct {
@@ -488,9 +494,14 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 
 	if !repeat {
 		// replicate the content if it's new
-		dataCopy := xmitBuf.Get().([]byte)[:len(newseg.data)]
-		copy(dataCopy, newseg.data)
-		newseg.data = dataCopy
+		dataCopy := xmitBuf.Get().([]byte)
+		l := copy(dataCopy[:len(newseg.data)], newseg.data)
+
+		if kcp.input == nil {
+			newseg.data = dataCopy[:l]
+		} else {
+			kcp.input.Input(dataCopy, l)
+		}
 
 		if insert_idx == n+1 {
 			kcp.rcv_buf = append(kcp.rcv_buf, newseg)
@@ -513,7 +524,9 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 		}
 	}
 	if count > 0 {
-		kcp.rcv_queue = append(kcp.rcv_queue, kcp.rcv_buf[:count]...)
+		if kcp.input == nil {
+			kcp.rcv_queue = append(kcp.rcv_queue, kcp.rcv_buf[:count]...)
+		}
 		kcp.rcv_buf = kcp.remove_front(kcp.rcv_buf, count)
 	}
 
@@ -663,6 +676,9 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 }
 
 func (kcp *KCP) wnd_unused() uint16 {
+	if kcp.input != nil {
+		return kcp.input.WndUnused()
+	}
 	if len(kcp.rcv_queue) < int(kcp.rcv_wnd) {
 		return uint16(int(kcp.rcv_wnd) - len(kcp.rcv_queue))
 	}

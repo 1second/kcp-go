@@ -60,11 +60,12 @@ func init() {
 type (
 	// UDPSession defines a KCP session implemented by UDP
 	UDPSession struct {
-		conn    net.PacketConn // the underlying packet connection
-		ownConn bool           // true if we created conn internally, false if provided by caller
-		kcp     *KCP           // KCP ARQ protocol
-		l       *Listener      // pointing to the Listener object if it's been accepted by a Listener
-		block   BlockCrypt     // block encryption object
+		conn          net.PacketConn // the underlying packet connection
+		ownConn       bool           // true if we created conn internally, false if provided by caller
+		kcp           *KCP           // KCP ARQ protocol
+		l             *Listener      // pointing to the Listener object if it's been accepted by a Listener
+		block         BlockCrypt     // block encryption object
+		appHeaderSize int
 
 		// kcp receiving is based on packets
 		// recvbuf turns packets into stream
@@ -105,6 +106,7 @@ type (
 		txqueue         []ipv4.Message
 		xconn           batchConn // for x/net
 		xconnWriteError error
+		appTx           func(txqueue []ipv4.Message)
 
 		mu sync.Mutex
 	}
@@ -139,6 +141,16 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	sess.block = block
 	sess.recvbuf = make([]byte, mtuLimit)
 
+	if appHeaderSizer, ok := conn.(interface {
+		AppHeaderSize() int
+	}); ok {
+		sess.appHeaderSize = appHeaderSizer.AppHeaderSize()
+	}
+	if conn == nil {
+		sess.appHeaderSize = 18
+	}
+	sess.headerSize += sess.appHeaderSize
+
 	// cast to writebatch conn
 	if _, ok := conn.(*net.UDPConn); ok {
 		addr, err := net.ResolveUDPAddr("udp", conn.LocalAddr().String())
@@ -154,9 +166,9 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	// FEC codec initialization
 	sess.fecDecoder = newFECDecoder(dataShards, parityShards)
 	if sess.block != nil {
-		sess.fecEncoder = newFECEncoder(dataShards, parityShards, cryptHeaderSize)
+		sess.fecEncoder = newFECEncoder(dataShards, parityShards, cryptHeaderSize+sess.appHeaderSize)
 	} else {
-		sess.fecEncoder = newFECEncoder(dataShards, parityShards, 0)
+		sess.fecEncoder = newFECEncoder(dataShards, parityShards, sess.appHeaderSize)
 	}
 
 	// calculate additional header size introduced by FEC and encryption
@@ -175,7 +187,9 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	sess.kcp.ReserveBytes(sess.headerSize)
 
 	if sess.l == nil { // it's a client connection
-		go sess.readLoop()
+		if sess.conn != nil {
+			go sess.readLoop()
+		}
 		atomic.AddUint64(&DefaultSnmp.ActiveOpens, 1)
 	} else {
 		atomic.AddUint64(&DefaultSnmp.PassiveOpens, 1)
@@ -332,7 +346,11 @@ func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
 // uncork sends data in txqueue if there is any
 func (s *UDPSession) uncork() {
 	if len(s.txqueue) > 0 {
-		s.tx(s.txqueue)
+		if s.appTx != nil {
+			s.appTx(s.txqueue)
+		} else {
+			s.tx(s.txqueue)
+		}
 		// recycle
 		for k := range s.txqueue {
 			xmitBuf.Put(s.txqueue[k].Buffers[0])
@@ -449,6 +467,17 @@ func (s *UDPSession) SetStreamMode(enable bool) {
 	}
 }
 
+// SetInputCallback switch to packet(unordered)  mode
+func (s *UDPSession) SetInputCallback(input InputCallback) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.kcp.input = input
+}
+
+func (s *UDPSession) SetAppTx(tx func(txqueue []ipv4.Message)) {
+	s.appTx = tx
+}
+
 // SetACKNoDelay changes ack flush option, set true to flush ack immediately,
 func (s *UDPSession) SetACKNoDelay(nodelay bool) {
 	s.mu.Lock()
@@ -547,16 +576,18 @@ func (s *UDPSession) output(buf []byte) {
 
 	// 2&3. crc32 & encryption
 	if s.block != nil {
+		buf := buf[s.appHeaderSize:]
 		s.nonce.Fill(buf[:nonceSize])
 		checksum := crc32.ChecksumIEEE(buf[cryptHeaderSize:])
 		binary.LittleEndian.PutUint32(buf[nonceSize:], checksum)
 		s.block.Encrypt(buf, buf)
 
 		for k := range ecc {
-			s.nonce.Fill(ecc[k][:nonceSize])
-			checksum := crc32.ChecksumIEEE(ecc[k][cryptHeaderSize:])
-			binary.LittleEndian.PutUint32(ecc[k][nonceSize:], checksum)
-			s.block.Encrypt(ecc[k], ecc[k])
+			buf := ecc[k][s.appHeaderSize:]
+			s.nonce.Fill(buf[:nonceSize])
+			checksum := crc32.ChecksumIEEE(buf[cryptHeaderSize:])
+			binary.LittleEndian.PutUint32(buf[nonceSize:], checksum)
+			s.block.Encrypt(buf, buf)
 		}
 	}
 
@@ -647,6 +678,10 @@ func (s *UDPSession) notifyWriteError(err error) {
 		s.socketWriteError.Store(err)
 		close(s.chSocketWriteError)
 	})
+}
+
+func (s *UDPSession) PacketInput(data []byte) {
+	s.packetInput(data)
 }
 
 // packet input stage
