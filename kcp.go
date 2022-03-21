@@ -43,6 +43,7 @@ type output_callback func(buf []byte, size int)
 type InputCallback interface {
 	Input(buf []byte, size int)
 	WndUnused() uint16
+	ObtainBuf() []byte
 }
 
 /* encode 8 bits unsigned int */
@@ -157,10 +158,11 @@ type KCP struct {
 
 	acklist []ackItem
 
-	buffer   []byte
-	reserved int
-	output   output_callback
-	input    InputCallback
+	buffer       []byte
+	reserved     int
+	output       output_callback
+	input        InputCallback
+	dataAcceptCb func()
 }
 
 type ackItem struct {
@@ -494,19 +496,21 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 
 	if !repeat {
 		// replicate the content if it's new
-		dataCopy := xmitBuf.Get().([]byte)
-		l := copy(dataCopy[:len(newseg.data)], newseg.data)
 
 		if kcp.input == nil {
+			dataCopy := xmitBuf.Get().([]byte)
+			l := copy(dataCopy[:len(newseg.data)], newseg.data)
 			newseg.data = dataCopy[:l]
 		} else {
+			dataCopy := kcp.input.ObtainBuf()
+			l := copy(dataCopy[:len(newseg.data)], newseg.data)
 			kcp.input.Input(dataCopy, l)
 		}
 
 		if insert_idx == n+1 {
 			kcp.rcv_buf = append(kcp.rcv_buf, newseg)
 		} else {
-			kcp.rcv_buf = append(kcp.rcv_buf, segment{})
+			kcp.rcv_buf = append(kcp.rcv_buf, newseg)
 			copy(kcp.rcv_buf[insert_idx+1:], kcp.rcv_buf[insert_idx:])
 			kcp.rcv_buf[insert_idx] = newseg
 		}
@@ -613,6 +617,9 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 			}
 			if regular && repeat {
 				atomic.AddUint64(&DefaultSnmp.RepeatSegs, 1)
+			}
+			if regular && !repeat && kcp.dataAcceptCb != nil {
+				kcp.dataAcceptCb()
 			}
 		} else if cmd == IKCP_CMD_WASK {
 			// ready to send back IKCP_CMD_WINS in Ikcp_flush

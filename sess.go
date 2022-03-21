@@ -13,6 +13,8 @@ import (
 	"hash/crc32"
 	"io"
 	"net"
+	"os"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -109,6 +111,7 @@ type (
 		appTx           func(txqueue []ipv4.Message)
 
 		mu sync.Mutex
+		//mu *mu
 	}
 
 	setReadBuffer interface {
@@ -123,6 +126,54 @@ type (
 		SetDSCP(int) error
 	}
 )
+
+func newMu() *mu {
+	l := new(sync.Mutex)
+	return &mu{
+		locked: false,
+		lock:   l,
+		cond:   sync.NewCond(l),
+	}
+}
+
+type mu struct {
+	lock   *sync.Mutex
+	cond   *sync.Cond
+	locked bool
+	cnt    int
+}
+
+func (m *mu) Lock() {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	for m.locked {
+		m.cond.Wait()
+	}
+
+	m.cnt++
+	term := m.cnt
+	stack := debug.Stack()
+	m.locked = true
+	go func() {
+		time.Sleep(time.Second)
+		m.lock.Lock()
+		defer m.lock.Unlock()
+		if term == m.cnt && m.locked {
+			os.Stderr.Write(stack)
+		}
+	}()
+
+}
+
+func (m *mu) Unlock() {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	if !m.locked {
+		panic("unlock unlocked mutex")
+	}
+	m.locked = false
+	m.cond.Signal()
+}
 
 // newUDPSession create a new udp session for client or server
 func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn net.PacketConn, ownConn bool, remote net.Addr, block BlockCrypt) *UDPSession {
@@ -140,6 +191,7 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	sess.l = l
 	sess.block = block
 	sess.recvbuf = make([]byte, mtuLimit)
+	//sess.mu = newMu()
 
 	if appHeaderSizer, ok := conn.(interface {
 		AppHeaderSize() int
@@ -299,6 +351,7 @@ func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
 						s.kcp.Send(b)
 						break
 					} else {
+						println("kcp packet split", s.kcp.mss, len(b))
 						s.kcp.Send(b[:s.kcp.mss])
 						b = b[s.kcp.mss:]
 					}
@@ -360,6 +413,19 @@ func (s *UDPSession) uncork() {
 	}
 }
 
+func (s *UDPSession) CloseMsg(bufs [][]byte) {
+	s.kcp.snd_wnd *= 2
+	s.kcp.rmt_wnd *= 2
+	s.notifyWriteEvent()
+	s.mu.Lock()
+	for _, buf := range bufs {
+		s.kcp.Send(buf)
+	}
+	s.kcp.flush(false)
+	s.uncork()
+	s.mu.Unlock()
+}
+
 // Close closes the connection.
 func (s *UDPSession) Close() error {
 	var once bool
@@ -386,6 +452,7 @@ func (s *UDPSession) Close() error {
 			s.l.closeSession(s.remote)
 			return nil
 		} else if s.ownConn { // client socket close
+			println("kcp-go close ownConn")
 			return s.conn.Close()
 		} else {
 			return nil
@@ -454,6 +521,12 @@ func (s *UDPSession) SetMtu(mtu int) bool {
 	defer s.mu.Unlock()
 	s.kcp.SetMtu(mtu)
 	return true
+}
+
+func (s *UDPSession) GetMss() uint32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.kcp.mss
 }
 
 // SetStreamMode toggles the stream mode on/off
@@ -680,7 +753,8 @@ func (s *UDPSession) notifyWriteError(err error) {
 	})
 }
 
-func (s *UDPSession) PacketInput(data []byte) {
+func (s *UDPSession) PacketInput(data []byte, acceptCb func()) {
+	s.kcp.dataAcceptCb = acceptCb
 	s.packetInput(data)
 }
 
